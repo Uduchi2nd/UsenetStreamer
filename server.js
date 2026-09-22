@@ -1816,7 +1816,7 @@ async function streamHandler(req, res) {
     }
 
     const streamCacheKey = STREAM_CACHE_MAX_ENTRIES > 0
-      ? buildStreamCacheKey({ type, id, requestedEpisode, query: req.query || {}, profileName: req.profileName })
+      ? 'stratified30-v1:' + buildStreamCacheKey({ type, id, requestedEpisode, query: req.query || {}, profileName: req.profileName })
       : null;
     let cachedStreamEntry = null;
     let cachedSearchMeta = null;
@@ -3330,7 +3330,7 @@ async function streamHandler(req, res) {
     const healthIndexerSet = new Set((combinedHealthTokens || []).map((token) => normalizeIndexerToken(token)).filter(Boolean));
     console.log(`[NZB TRIAGE] Easynews health check mode: ${EASYNEWS_TREAT_AS_INDEXER ? 'ENABLED' : 'DISABLED'}`);
 
-    // Fetch NZBDav history early — needed to skip completed NZBs from triage pool
+    // Fetch NZBDav history early for mounted status and failed-job filtering
     // and filter out failed NZBs from results before building streams
     const categoryForType = effStreamingMode !== 'native' ? nzbdavService.getNzbdavCategory(type) : null;
     let historyByTitle = new Map();
@@ -3374,19 +3374,11 @@ async function streamHandler(req, res) {
       if (result && result.downloadUrl) resultRankByUrl.set(result.downloadUrl, index);
     });
 
-    // Collect NZBs already completed in NZBDav so Smart Play can select them
-    // even though they are excluded from health-check triage below.
+    // Do not seed unchecked completed jobs into Smart Play.
     const completedCandidates = [];
-    let triagePoolSkippedInstant = 0;
     const triagePool = healthIndexerSet.size > 0
       ? finalNzbResults.filter((result) => {
-        // Skip NZBs already completed in NZBDav — they already have ⚡ Instant badge
-        const normTitle = normalizeReleaseTitle(result.title);
-        if (normTitle && historyByTitle.has(normTitle)) {
-          triagePoolSkippedInstant++;
-          completedCandidates.push(result);
-          return false;
-        }
+        // Completed means mounted, not intact: these require the same screening.
         // Include regular indexer matches
         if (nzbMatchesIndexer(result, healthIndexerSet)) {
           return true;
@@ -3399,9 +3391,6 @@ async function streamHandler(req, res) {
         return false;
       })
       : [];
-    if (triagePoolSkippedInstant > 0) {
-      console.log(`[NZB TRIAGE] Skipped ${triagePoolSkippedInstant} NZBs already completed in NZBDav`);
-    }
     console.log(`[NZB TRIAGE] Triage pool size: ${triagePool.length} (from ${finalNzbResults.length} total results)`);
     const getDecisionStatus = (candidate) => {
       const decision = triageDecisions.get(candidate.downloadUrl);
@@ -3715,7 +3704,7 @@ async function streamHandler(req, res) {
       // Cache entries are managed internally by the cache module
       const normalizedTitle = normalizeReleaseTitle(result.title);
       const historySlot = normalizedTitle ? historyByTitle.get(normalizedTitle) : null;
-      const isInstant = Boolean(historySlot); // Instant playback if found in history
+      const isInstant = Boolean(historySlot); // Mounted; health eligibility is checked below
 
       const directTriageInfo = triageDecisions.get(result.downloadUrl);
       const fallbackTitleKey = normalizedTitle;
@@ -3727,6 +3716,8 @@ async function streamHandler(req, res) {
       const triageApplied = Boolean(directTriageInfo);
       const triageDerivedFromTitle = Boolean(!directTriageInfo && fallbackAllowed && fallbackTriageInfo);
       const triageStatus = triageInfo?.status || (triageApplied ? 'unknown' : 'not-run');
+      // Never advertise an unchecked completed entry as instant/ready.
+      if (historySlot && effTriageEnabled && triageStatus !== 'verified') return null;
       if (INDEXER_HIDE_BLOCKED_RESULTS && triageStatus === 'blocked') {
         if (triageInfo) {
           // console.log('[STREMIO][TRIAGE] Hiding blocked stream', {

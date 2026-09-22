@@ -1,3 +1,4 @@
+const { sampleSegments, checkSample } = require('./stratified');
 const { parseStringPromise } = require('xml2js');
 const fs = require('fs/promises');
 const path = require('path');
@@ -336,6 +337,31 @@ async function analyzeSingleNzb(raw, ctx) {
   const checkedSegments = new Set();
   let primaryArchive = null;
 
+  // Check every media/archive file across its full ordered article range.
+  // PAR2, NFO and other ancillary files are not playback data.
+  const sampleFiles = files.filter(file => isArchiveFile(file)
+    || isPlayableVideoName(file.filename || '') || isIsoFileName(file.filename));
+  const sample = sampleFiles.flatMap(file => sampleSegments(file.segments));
+  let sampleResult;
+  try {
+    sampleResult = await checkSample(ctx.nntpPool, sample);
+  } catch (_) {
+    return buildDecision('accept', new Set(), new Set(['sample-incomplete']), {
+      fileCount: files.length, nzbTitle: extractTitle(parsed), nzbIndex: ctx.nzbIndex,
+      archiveFindings: [{ source: 'stratified-stat', status: 'segment-error',
+        details: { fraction: 0.30, planned: sample.length } }],
+    });
+  }
+  archiveFindings.push({ source: 'stratified-stat',
+    status: sampleResult.missing ? 'segment-missing' : 'segment-ok',
+    details: { fraction: 0.30, ...sampleResult } });
+  if (sampleResult.missing) {
+    return buildDecision('reject', new Set(['missing-articles']), warnings, {
+      fileCount: files.length, nzbTitle: extractTitle(parsed), nzbIndex: ctx.nzbIndex,
+      archiveFindings,
+    });
+  }
+
   // Early NZB-level check: detect multipart RAR sets with inconsistent segment counts
   const inconsistentParts = detectInconsistentRarParts(files);
   if (inconsistentParts) {
@@ -405,7 +431,7 @@ async function analyzeSingleNzb(raw, ctx) {
     if (!ctx.nntpPool) {
       if (ctx.nntpError) warnings.add(`nntp-error:${ctx.nntpError.code ?? ctx.nntpError.message}`);
       else warnings.add('nntp-disabled');
-    } else if (uniqueSegments.length > 0) {
+    } else if (!sampleResult && uniqueSegments.length > 0) {
       const fallbackSampleCount = Math.max(1, Math.floor(ctx.config?.archiveSampleCount ?? 1));
       const sampledSegments = pickRandomElements(uniqueSegments, fallbackSampleCount);
       await Promise.all(sampledSegments.map(async ({ segmentId, file }) => {
@@ -507,7 +533,7 @@ async function analyzeSingleNzb(raw, ctx) {
 
   // Run STAT sampling for any archive inspection (including 7z) to detect missing articles
   const archiveInspected = Boolean(primaryArchive);
-  if (ctx.nntpPool && archiveInspected && blockers.size === 0) {
+  if (!sampleResult && ctx.nntpPool && archiveInspected && blockers.size === 0) {
     const extraStatChecks = Math.max(0, Math.floor(ctx.config?.statSampleCount ?? 0));
     if (extraStatChecks > 0 && primaryArchive?.segments?.length) {
       const availablePrimarySegments = primaryArchive.segments
