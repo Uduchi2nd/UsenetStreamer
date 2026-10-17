@@ -193,7 +193,8 @@ async function triageAndRank(nzbResults, options = {}) {
     : builtCandidates;
   const foregroundResolutions = options.foregroundResolutions || [];
   const candidates = prioritizeResolutionCandidates(
-    rankCandidates(constrainedCandidates, preferredSizeBytes, preferredIndexerSet), foregroundResolutions);
+    rankCandidates(constrainedCandidates, preferredSizeBytes, preferredIndexerSet), foregroundResolutions,
+    options.downloadConcurrency ?? DEFAULT_DOWNLOAD_CONCURRENCY);
   const uniqueCandidates = [];
   const seenTitles = new Set();
   candidates.forEach((candidate) => {

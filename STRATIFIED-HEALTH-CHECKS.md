@@ -56,20 +56,21 @@ the benchmark below selects 128 for the current build.
 Coverage stays at 30%; successful samples still require every selected reply,
 including a matching article ID. Missing pieces drain the outstanding batch
 before rejecting. This reduces protocol round trips without adding connections.
-Active file jobs per batch are bounded by the configured parallelism and NNTP
-connection count, rather than launching every candidate at once. This prevents
-the first file's archive-header reads from waiting behind a whole batch of
-other files' sampling. The candidate and time budgets remain in effect. The
-current Containerfile also overlays and syntax-checks progressive.js.
+Active release jobs are bounded by the configured download concurrency and
+parallel-NZB limit, currently four. The shared NNTP pool separately caps network
+connections at two. Queued archive/header reads finish verification before the
+pool starts another queued article scan, avoiding the earlier backlog behind
+every candidate's sampling. Candidate and time budgets remain in effect.
 
-The queue gives an idle worker to each missing target resolution before
-starting alternatives of a resolution already in progress. After a resolution
-verifies, remaining missing resolutions take priority. Resolution representatives
-are selected before the existing candidate/indexer caps; neither cap is raised.
+The queue balances active candidates across missing target resolutions: with
+four jobs and both targets present, two initially try 4K and two try 1080p.
+After a resolution verifies, remaining missing resolutions take priority.
+Enough representatives for those workers are reserved before the existing
+candidate/indexer caps; neither cap is raised.
 Renderer labels, cached coverage and worker scheduling use the same resolution
 parser, including 2160p/UHD aliases. The runner is now included in the overlay.
 
-Focused checks: `node --test test/stratified.test.js test/progressive.test.js test/runner-progressive.test.js`.
+Focused checks: `node --test test/stratified.test.js test/progressive.test.js test/runner-progressive.test.js test/nntp-priority.test.js`.
 The tests cover proof before early responses, duplicate job sharing, profile
 isolation, resuming partial cached responses, runner failures, stale cache
 generations, pending decisions, and the sampler's existing protocol guarantees.
@@ -115,3 +116,47 @@ This is a sampler measurement, not a 10.2% promise for complete listing time.
 Numeric evidence is retained privately at
 `~/usenet/stat-window-benchmark-20261017/decision.json`; raw fixture selections
 and logs in that directory must remain private.
+
+## Parallel release queues — 2026-10-17
+
+Release-job concurrency now honors `NZB_TRIAGE_DOWNLOAD_CONCURRENCY`, capped by
+the candidate and parallel-NZB limits. With the current values (4/16/4), four
+release jobs overlap their metadata downloads and health work. Each NNTP lease
+still belongs to one task; the two-connection pool is not enlarged. The sampler
+uses lower-priority leases so archive/header reads that complete verification
+can overtake queued scans. FIFO order within each priority, acquisition
+deadlines, batch draining and parser disposal remain. A replacement that
+finishes connecting after pool shutdown is immediately closed.
+
+The foreground still waits for one verified choice per available target
+resolution or normal batch completion/deadline. Work that already verified a
+resolution is retained while another candidate of that resolution is slow.
+Equivalent requests still share a job and its background completion updates
+the matching cached response. Explicit background mode uses the same
+resolution preferences. No unchecked result can satisfy the foreground gate.
+
+Thirty-two focused tests cover these rules, including two workers per
+resolution despite many larger 4K candidates, a successful alternate overtaking
+a stalled first candidate, lease priority on both release and replacement,
+closing queued leases, and late-replacement cleanup.
+
+Isolated full-check comparison used four real cached NZBs (two per resolution;
+three from Infinity Castle and one other cached 4K release), fixed candidate
+ranking, seeded article samples and the normal bounded archive-header checks.
+Warmups were excluded and order alternated. Connection setup and indexer
+search are outside these measurements. A second controlled scenario delayed
+the first 4K metadata response by six seconds using an in-memory stub; no
+indexer download was made for that delay.
+
+| Scenario | Trials per version | Two jobs, median to both verified | Four jobs, median to both verified |
+| --- | --- | --- | --- |
+| Cached metadata | 3 | 3.098 s | 3.104 s |
+| Simulated slow first metadata source | 2 | 4.956 s | 3.032 s |
+
+The benefit is hedging a slow candidate; already-ready metadata is not a
+general speedup. All twelve trials, including warmups, verified all four
+releases without timeouts, stayed within two NNTP connections, and received
+the same 1,680,398 bytes for their complete four-release check. RSS was
+141–150 MiB. This benchmark is not a claim about full page-load latency.
+Private numeric evidence and raw diagnostic logs are retained under
+`~/usenet/candidate-queues-benchmark-20261017/`.

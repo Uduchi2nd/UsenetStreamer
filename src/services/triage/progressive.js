@@ -28,27 +28,31 @@ function getResolutionCoverage(candidates, getStatus) {
 
 // Reserve a place for each requested resolution before applying existing
 // candidate/indexer limits. Preserve the original order for the other releases.
-function prioritizeResolutionCandidates(candidates, resolutions) {
+function prioritizeResolutionCandidates(candidates, resolutions, concurrency = resolutions.length) {
   const remaining = candidates.slice(), first = [];
-  for (const resolution of resolutions) {
-    const index = remaining.findIndex(candidate => getReleaseResolution(candidate) === resolution);
-    if (index >= 0) first.push(...remaining.splice(index, 1));
+  const rounds = Math.ceil(concurrency / Math.max(1, resolutions.length));
+  for (let round = 0; round < rounds; round++) {
+    for (const resolution of resolutions) {
+      const index = remaining.findIndex(candidate => getReleaseResolution(candidate) === resolution);
+      if (index >= 0) first.push(...remaining.splice(index, 1));
+    }
   }
   return [...first, ...remaining];
 }
 
-// Give missing resolutions a connection each before trying alternatives of a
-// resolution already being checked. Once a resolution verifies, prioritize
-// remaining gaps, then continue the original bounded batch in the background.
+// Balance active candidates across missing resolutions, so extra workers try
+// two of each rather than filling every spare slot with more 4K releases.
+// Once a resolution verifies, focus spare workers on the remaining gaps.
 function createResolutionQueue(candidates, resolutions) {
   const pending = candidates.slice(), active = new Map(), verified = new Set();
   return {
     next() {
       if (!pending.length) return null;
       const missing = resolutions.filter(resolution => !verified.has(resolution));
-      const idle = missing.filter(resolution => !active.get(resolution));
-      let index = pending.findIndex(candidate => idle.includes(getReleaseResolution(candidate)));
-      if (index < 0) index = pending.findIndex(candidate => missing.includes(getReleaseResolution(candidate)));
+      const available = missing.filter(resolution => pending.some(candidate => getReleaseResolution(candidate) === resolution));
+      const leastActive = Math.min(...available.map(resolution => active.get(resolution) || 0));
+      const preferred = available.filter(resolution => (active.get(resolution) || 0) === leastActive);
+      let index = pending.findIndex(candidate => preferred.includes(getReleaseResolution(candidate)));
       if (index < 0) index = 0;
       const [candidate] = pending.splice(index, 1);
       const resolution = getReleaseResolution(candidate);

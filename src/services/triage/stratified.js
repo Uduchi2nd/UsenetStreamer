@@ -18,7 +18,9 @@ function sampleSegments(segments, random = Math.random) {
 // the existing pool connection budget and avoids leftover response poisoning.
 async function checkSample(pool, segments, timeoutMs = 12000) {
   if (!pool || !segments.length) throw new Error('sample unavailable');
-  const client = await pool.acquire();
+  // Header/archive reads finish verification. Let those queued reads run
+  // before starting another long article scan when more releases are active.
+  const client = await pool.acquire({ priority: 'sample' });
   if (!client) throw new Error('sample client unavailable');
   const socket = client._socket;
   try {

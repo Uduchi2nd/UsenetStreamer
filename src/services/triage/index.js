@@ -2898,6 +2898,10 @@ async function createNntpPool(config, maxConnections, options = {}) {
 
   const idle = initialClients.slice();
   const waiters = [];
+  const nextWaiter = () => {
+    const index = waiters.findIndex(waiter => !waiter.sample);
+    return waiters.splice(index < 0 ? 0 : index, 1)[0];
+  };
   const allClients = new Set(initialClients);
   let closing = false;
   let lastUsed = Date.now();
@@ -2912,10 +2916,14 @@ async function createNntpPool(config, maxConnections, options = {}) {
     (async () => {
       try {
         const replacement = await createNntpClient(config);
+        if (closing) {
+          await closeNntpClient(replacement);
+          return;
+        }
         attachErrorHandler(replacement);
         allClients.add(replacement);
         if (waiters.length > 0) {
-          const waiter = waiters.shift();
+          const waiter = nextWaiter();
           touch();
           waiter(replacement);
         } else {
@@ -3008,7 +3016,7 @@ async function createNntpPool(config, maxConnections, options = {}) {
       return;
     }
     if (waiters.length > 0) {
-      const waiter = waiters.shift();
+      const waiter = nextWaiter();
       touch();
       waiter(client);
     } else {
@@ -3020,7 +3028,7 @@ async function createNntpPool(config, maxConnections, options = {}) {
 
   const ACQUIRE_TIMEOUT_MS = 15000;
 
-  const acquireClient = () => new Promise((resolve, reject) => {
+  const acquireClient = (options = {}) => new Promise((resolve, reject) => {
     if (closing) {
       reject(new Error('NNTP pool closing'));
       return;
@@ -3052,6 +3060,7 @@ async function createNntpPool(config, maxConnections, options = {}) {
         clearTimeout(timer);
         resolve(client);
       };
+      waiterResolve.sample = options.priority === 'sample';
       waiters.push(waiterResolve);
     }
   });

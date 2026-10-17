@@ -3417,6 +3417,11 @@ async function streamHandler(req, res) {
     const pendingStatuses = new Set(['unverified', 'pending', 'fetch-error', 'error']);
     const hasVerifiedResult = triagePool.some((candidate) => getDecisionStatus(candidate) === 'verified');
     const missingResolutions = getResolutionCoverage(triagePool, getDecisionStatus).missing;
+    // Release jobs overlap metadata downloads and hedge slow candidates; the
+    // shared NNTP pool separately bounds network work and favors finishing
+    // verification before another queued article scan.
+    const triageDownloadConcurrency = Math.max(1,
+      Math.min(TRIAGE_MAX_CANDIDATES, TRIAGE_MAX_PARALLEL_NZBS, TRIAGE_DOWNLOAD_CONCURRENCY));
     let triageEligibleResults = [];
     const paidIndexerLimitMap = buildCombinedLimitMap(ACTIVE_NEWZNAB_CONFIGS);
     const getIndexerKey = (candidate) => normalizeIndexerToken(candidate?.indexerId || candidate?.indexer);
@@ -3427,7 +3432,7 @@ async function streamHandler(req, res) {
         || (!status && (!hasVerifiedResult || missingResolutions.includes(getReleaseResolution(candidate))));
     });
     triageEligibleResults = prioritizeTriageCandidates(
-      prioritizeResolutionCandidates(candidatesNeedingChecks, missingResolutions), TRIAGE_MAX_CANDIDATES, {
+      prioritizeResolutionCandidates(candidatesNeedingChecks, missingResolutions, triageDownloadConcurrency), TRIAGE_MAX_CANDIDATES, {
         perIndexerLimitMap: paidIndexerLimitMap,
         getIndexerKey,
       });
@@ -3452,11 +3457,6 @@ async function streamHandler(req, res) {
     const effectiveTriageMode = triageWanted ? effTriageMode : 'disabled';
     const shouldAttemptTriage = triageWanted && effectiveTriageMode === 'blocking';
     const shouldAttemptBackgroundTriage = triageWanted && effectiveTriageMode === 'background';
-    // Keep each file's sampling and archive-header phases moving. Starting 16
-    // file jobs on a two-connection pool makes the first file's header reads
-    // queue behind every other file's sampling, delaying the first proof.
-    const triageDownloadConcurrency = Math.max(1,
-      Math.min(TRIAGE_MAX_CANDIDATES, TRIAGE_MAX_PARALLEL_NZBS, TRIAGE_NNTP_MAX_CONNECTIONS));
     let triageOutcome = null;
     let progressiveTriageJob = null;
     let triageCompleteForCache = !shouldAttemptTriage;
@@ -4369,6 +4369,7 @@ async function streamHandler(req, res) {
             timeBudgetMs: TRIAGE_TIME_BUDGET_MS,
             maxCandidates: TRIAGE_MAX_CANDIDATES,
             downloadConcurrency: triageDownloadConcurrency,
+            foregroundResolutions: foregroundCoverage.missing,
             triageOptions: {
               ...TRIAGE_BASE_OPTIONS,
               nntpConfig: { ...TRIAGE_NNTP_CONFIG },

@@ -119,3 +119,38 @@ test('a title offering only 1080p returns after one verified choice while its al
   alternate.resolve(good());
   await job.completion;
 });
+
+test('four workers balance two candidates per resolution and return before a stalled first candidate', async () => {
+  const releases = [release('uhd-a', '4k', 100), release('uhd-b', '4k', 90),
+    release('uhd-c', '4k', 80), release('hd-a', '1080p', 50), release('hd-b', '1080p', 40)];
+  const gates = new Map(releases.map(candidate => [candidate.downloadUrl, deferred()]));
+  const started = [];
+  let active = 0, maxActive = 0;
+  const runner = loadRunner(async ([payload]) => {
+    started.push(payload); maxActive = Math.max(maxActive, ++active);
+    try { return await gates.get(payload).promise; } finally { active--; }
+  });
+  const { job } = createProgressiveTriage(runner).start('four-workers', releases,
+    options(releases, { downloadConcurrency: 4 }));
+  await tick();
+  assert.deepEqual(started, [releases[0], releases[3], releases[1], releases[4]].map(candidate => candidate.downloadUrl));
+  gates.get(releases[1].downloadUrl).resolve(good());
+  gates.get(releases[4].downloadUrl).resolve(good());
+  const early = await job.foreground;
+  assert.equal(early.decisions.get(releases[1].downloadUrl).status, 'verified');
+  assert.equal(early.decisions.get(releases[4].downloadUrl).status, 'verified');
+  assert.equal(early.decisions.has(releases[0].downloadUrl), false);
+  assert.equal(job.done, false);
+  assert.equal(maxActive, 4);
+  for (const gate of gates.values()) gate.resolve(good());
+  await job.completion;
+});
+
+test('four candidates include two of each resolution inside the runner candidate cap', async () => {
+  const releases = Array.from({ length: 20 }, (_, i) => release(`uhd-${i}`, '4k', 100 - i));
+  releases.push(release('hd-a', '1080p', 10), release('hd-b', '1080p', 9));
+  const seen = [];
+  const runner = loadRunner(async ([payload]) => { seen.push(payload); return good(); });
+  await runner(releases, options(releases, { downloadConcurrency: 4, maxCandidates: 4 }));
+  assert.deepEqual(new Set(seen), new Set([releases[0], releases[1], releases.at(-2), releases.at(-1)].map(candidate => candidate.downloadUrl)));
+});
