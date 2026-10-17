@@ -1,4 +1,4 @@
 FROM ghcr.io/sanket9225/usenetstreamer@sha256:3b765743f5a3daed4ca645da1cc80d2c66b3984acd1809a4df74b2b426eba3a5
 COPY server.js /usr/src/app/server.js
-COPY src/services/triage/index.js src/services/triage/stratified.js /usr/src/app/src/services/triage/
-RUN node --check server.js && node --check src/services/triage/index.js && node --check src/services/triage/stratified.js
+COPY src/services/triage/index.js src/services/triage/stratified.js src/services/triage/progressive.js /usr/src/app/src/services/triage/
+RUN node --check server.js && node --check src/services/triage/index.js && node --check src/services/triage/stratified.js && node --check src/services/triage/progressive.js

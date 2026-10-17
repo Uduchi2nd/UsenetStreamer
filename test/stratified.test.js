@@ -18,12 +18,12 @@ function socket(reply) {
 }
 test('pipeline handles fragmented replies and checks the entire selected sample',async()=>{
   const s=socket((sock,ids)=>{const text=ids.map(id=>`223 0 <${id}> exists\r\n`).join('');sock.emit('data',Buffer.from(text.slice(0,7)));sock.emit('data',Buffer.from(text.slice(7)));});
-  const r=await pipeline(s,segments(50).map(x=>x.id),1000);
-  assert.deepEqual(r,{planned:50,checked:50,missing:0});assert.deepEqual(s.commands.map(a=>a.length),[16,16,16,2]);
+  const r=await pipeline(s,segments(150).map(x=>x.id),1000);
+  assert.deepEqual(r,{planned:150,checked:150,missing:0});assert.deepEqual(s.commands.map(a=>a.length),[64,64,22]);
 });
 test('missing article drains batch then rejects early',async()=>{
  const s=socket((sock,ids)=>sock.emit('data',Buffer.from(ids.map((id,i)=>i===2?'430 missing\r\n':`223 0 <${id}> exists\r\n`).join(''))));
- assert.deepEqual(await pipeline(s,segments(100).map(x=>x.id),1000),{planned:100,checked:16,missing:1});assert.equal(s.commands.length,1);
+ assert.deepEqual(await pipeline(s,segments(100).map(x=>x.id),1000),{planned:100,checked:64,missing:1});assert.equal(s.commands.length,1);
 });
 test('unexpected status and mismatched identity cannot pass',async()=>{
  for(const line of ['500 unavailable\r\n','223 0 <other@test> exists\r\n']) {

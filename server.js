@@ -104,6 +104,8 @@ const animeDatabase = require('./src/services/animeDatabase');
 const autoAdvanceQueue = require('./src/services/autoAdvanceQueue');
 const backgroundTriage = require('./src/services/backgroundTriage');
 const diskNzbCache = require('./src/cache/diskNzbCache');
+const { createProgressiveTriage, mergeCompletedDecisions } = require('./src/services/triage/progressive');
+const progressiveTriage = createProgressiveTriage(triageAndRank);
 const profileManager = require('./src/services/profileManager');
 
 // Periodic janitor — prune caches + sessions on a timer so RAM/disk stay
@@ -456,6 +458,7 @@ adminApiRouter.post('/config', async (req, res) => {
     // KEEP the on-disk NZB payloads — they stay valid across settings changes and
     // give fast re-mounts without re-downloading from indexers.
     cache.clearTransientCaches('admin-config-save');
+    progressiveTriage.clear();
     backgroundTriage.closeAllSessions('admin-config-save');
     autoAdvanceQueue.closeAllSessions('admin-config-save');
     const { portChanged } = rebuildRuntimeConfig();
@@ -1882,6 +1885,12 @@ async function streamHandler(req, res) {
       || (cachedSearchMeta
         ? restoreTriageDecisions(cachedSearchMeta.triageDecisionsSnapshot)
         : new Map());
+    // A progressive response can be cached before these candidates have any
+    // decision. Preserve that pending state so a second visit resumes the same
+    // job instead of declaring the response complete and losing its run ID.
+    for (const url of cachedSearchMeta?.triagePendingDownloadUrls || []) {
+      if (!triageDecisions.has(url)) triageDecisions.set(url, { status: 'pending' });
+    }
     // Resolve the dedupe mode up front. Priority:
     //   1. ?dedupeEnabled=false query override (force 'off' for power users)
     //   2. INDEXER_DEDUP_MODE (configured value)
@@ -3376,8 +3385,10 @@ async function streamHandler(req, res) {
 
     // Do not seed unchecked completed jobs into Smart Play.
     const completedCandidates = [];
+    const isVisibleRelease = result => !result.title || !RELEASE_BLOCKLIST_REGEX.test(result.title);
     const triagePool = healthIndexerSet.size > 0
       ? finalNzbResults.filter((result) => {
+        if (!isVisibleRelease(result)) return false;
         // Completed means mounted, not intact: these require the same screening.
         // Include regular indexer matches
         if (nzbMatchesIndexer(result, healthIndexerSet)) {
@@ -3447,7 +3458,13 @@ async function streamHandler(req, res) {
     const effectiveTriageMode = triageWanted ? effTriageMode : 'disabled';
     const shouldAttemptTriage = triageWanted && effectiveTriageMode === 'blocking';
     const shouldAttemptBackgroundTriage = triageWanted && effectiveTriageMode === 'background';
+    // Keep each file's sampling and archive-header phases moving. Starting 16
+    // file jobs on a two-connection pool makes the first file's header reads
+    // queue behind every other file's sampling, delaying the first proof.
+    const triageDownloadConcurrency = Math.max(1,
+      Math.min(TRIAGE_MAX_CANDIDATES, TRIAGE_MAX_PARALLEL_NZBS, TRIAGE_NNTP_MAX_CONNECTIONS));
     let triageOutcome = null;
+    let progressiveTriageJob = null;
     let triageCompleteForCache = !shouldAttemptTriage;
     let prefetchCandidate = null;
     let prefetchNzbPayload = null;
@@ -3468,7 +3485,7 @@ async function streamHandler(req, res) {
           serializedIndexerIds: serializedIndexerTokens,
           timeBudgetMs: TRIAGE_TIME_BUDGET_MS,
           maxCandidates: TRIAGE_MAX_CANDIDATES,
-          downloadConcurrency: Math.max(1, TRIAGE_MAX_CANDIDATES),
+          downloadConcurrency: triageDownloadConcurrency,
           triageOptions: {
             ...TRIAGE_BASE_OPTIONS,
             nntpConfig: { ...TRIAGE_NNTP_CONFIG },
@@ -3478,13 +3495,49 @@ async function streamHandler(req, res) {
           nzbPayloadCache: getOrPruneUpfrontPayloadCache(),
         };
         try {
-          triageOutcome = await triageAndRank(triageCandidatesToRun, triageOptions);
+          const scope = streamCacheKey || buildStreamCacheKey({
+            type, id, requestedEpisode, query: req.query || {}, profileName: req.profileName,
+          });
+          const existingJob = progressiveTriage.get(cachedSearchMeta?.triageRunId, scope);
+          const { job, joined } = existingJob
+            ? { job: existingJob, joined: true }
+            : progressiveTriage.start(scope, triageCandidatesToRun, triageOptions);
+          progressiveTriageJob = job;
+          console.log(`[NZB TRIAGE] ${joined ? 'Joined' : 'Started'} progressive job ${job.id} (workers=${triageDownloadConcurrency})`);
+          if (!joined) {
+            const candidatesByUrl = new Map(triageCandidatesToRun.map(candidate => [candidate.downloadUrl, candidate]));
+            job.completion.then(outcome => {
+              for (const [url, decision] of outcome.decisions) {
+                if (decision?.status === 'verified' && typeof decision.nzbPayload === 'string') {
+                  const candidate = candidatesByUrl.get(url);
+                  diskNzbCache.cacheToDisk(url, decision.nzbPayload, {
+                    title: decision.title || candidate?.title,
+                    size: candidate?.size,
+                    fileName: candidate?.title,
+                  });
+                }
+                if (decision?.nzbPayload) delete decision.nzbPayload;
+              }
+              if (streamCacheKey) {
+                cache.updateStreamCacheMeta(streamCacheKey, meta => {
+                  mergeCompletedDecisions(meta, job.id, outcome.decisions);
+                });
+              }
+              console.log(`[NZB TRIAGE] Background completion job=${job.id}: ${outcome.evaluatedCount}/${outcome.candidatesConsidered} candidates in ${outcome.elapsedMs} ms (timedOut=${outcome.timedOut})`);
+            }).catch(() => {
+              console.warn('[NZB TRIAGE] Background completion failed; unresolved releases remain pending');
+            });
+          }
+          // A previously verified release is already enough for a fast response.
+          // On a cold request, wait until a release actually passes, or all work
+          // finishes. Remaining candidates retain their real pending status.
+          triageOutcome = hasVerifiedResult ? job.snapshot() : await job.foreground;
           const latestDecisions = triageOutcome?.decisions instanceof Map ? triageOutcome.decisions : new Map(triageOutcome?.decisions || []);
           latestDecisions.forEach((decision, downloadUrl) => {
             triageDecisions.set(downloadUrl, decision);
           });
           triageTitleMap = buildTriageTitleMap(triageDecisions);
-          console.log(`[NZB TRIAGE] Evaluated ${triageOutcome.evaluatedCount}/${triageOutcome.candidatesConsidered} candidate NZBs in ${triageOutcome.elapsedMs} ms (timedOut=${triageOutcome.timedOut})`);
+          console.log(`[NZB TRIAGE] Evaluated ${triageOutcome.evaluatedCount}/${triageOutcome.candidatesConsidered} candidate NZBs in ${triageOutcome.elapsedMs} ms (timedOut=${triageOutcome.timedOut})${triageOutcome.inProgress ? ' [background continues]' : ''}`);
           if (triageDecisions.size > 0) {
             const statusCounts = {};
             let loggedSamples = 0;
@@ -3527,6 +3580,7 @@ async function streamHandler(req, res) {
       triageCompleteForCache = Boolean(
         triageOutcome
         && !triageOutcome?.timedOut
+        && !triageOutcome?.inProgress
         && triageDecisionsMatchStatuses(triageDecisions, triageEligibleResults, allowedCacheStatuses)
       );
     }
@@ -3623,11 +3677,13 @@ async function streamHandler(req, res) {
       .filter(Boolean);
     const isTriageFullyComplete = !shouldAttemptBackgroundTriage
       && !triageOutcome?.timedOut
+      && !triageOutcome?.inProgress
       && triagePendingDownloadUrls.length === 0;
     const cacheMeta = streamCacheKey
       ? {
         version: 1,
         storedAt: Date.now(),
+        triageRunId: progressiveTriageJob?.id || null,
         triageComplete: isTriageFullyComplete,
         triagePendingDownloadUrls: effectivePendingUrls,
         finalNzbResults: serializeFinalNzbResults(finalNzbResults),
@@ -3647,7 +3703,7 @@ async function streamHandler(req, res) {
 
     finalNzbResults.forEach((result) => {
       // Skip releases matching blocklist (ISO, sample, exe, etc.)
-      if (result.title && RELEASE_BLOCKLIST_REGEX.test(result.title)) {
+      if (!isVisibleRelease(result)) {
         return;
       }
 
@@ -4321,7 +4377,7 @@ async function streamHandler(req, res) {
             serializedIndexerIds: serializedIndexerTokens,
             timeBudgetMs: TRIAGE_TIME_BUDGET_MS,
             maxCandidates: TRIAGE_MAX_CANDIDATES,
-            downloadConcurrency: Math.max(1, TRIAGE_MAX_CANDIDATES),
+            downloadConcurrency: triageDownloadConcurrency,
             triageOptions: {
               ...TRIAGE_BASE_OPTIONS,
               nntpConfig: { ...TRIAGE_NNTP_CONFIG },
