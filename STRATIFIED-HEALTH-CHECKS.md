@@ -32,12 +32,15 @@ Rollback: stop/rename current usenetstreamer, rename preserved usenetstreamer-pr
 
 ## Progressive responses — 2026-10-17
 
-Blocking mode now returns after the first release passes the existing complete
-check, while the same batch finishes checking alternate releases in the
-background. When cached search results already contain a verified release,
-pending alternate checks do not block the response. A cold request without any
-verified result still waits for verification or the batch's normal completion;
-unchecked, failed and timed-out candidates cannot release that wait.
+Blocking mode returns once one release of each available target resolution
+(4K and 1080p) passes the existing complete check, while the same batch finishes
+checking alternates in the background. Cached verified choices count toward
+their own resolution; when both available resolutions are covered, pending
+alternates do not block. A title with only one target resolution needs one
+verified choice; other resolutions fall back to the first verified choice.
+The normal batch completion/deadline still releases the wait if a target has
+no successful candidate. Unchecked and inconclusive candidates never count
+as verified coverage.
 
 Concurrent equivalent health jobs share their NZB downloads and NNTP work.
 Jobs are isolated by profile, candidate identity and health policy. Cached
@@ -58,16 +61,29 @@ the first file's archive-header reads from waiting behind a whole batch of
 other files' sampling. The candidate and time budgets remain in effect. The
 current Containerfile also overlays and syntax-checks progressive.js.
 
-Focused checks: `node --test test/stratified.test.js test/progressive.test.js`.
+The queue gives an idle worker to each missing target resolution before
+starting alternatives of a resolution already in progress. After a resolution
+verifies, remaining missing resolutions take priority. Resolution representatives
+are selected before the existing candidate/indexer caps; neither cap is raised.
+Renderer labels, cached coverage and worker scheduling use the same resolution
+parser, including 2160p/UHD aliases. The runner is now included in the overlay.
+
+Focused checks: `node --test test/stratified.test.js test/progressive.test.js test/runner-progressive.test.js`.
 The tests cover proof before early responses, duplicate job sharing, profile
 isolation, resuming partial cached responses, runner failures, stale cache
 generations, pending decisions, and the sampler's existing protocol guarantees.
 Newly verified alternatives appear on a subsequent listing refresh; the HTTP
 response already sent to a client is not modified.
 
-Live Infinity Castle listing checks on 2026-10-17 took 21.441 seconds before
-this change and 10.353 seconds with it; subsequent requests took 0.205–0.211
+Initial first-verified-build checks on 2026-10-17 took 21.441 seconds before
+that change and 10.353 seconds with it; subsequent requests took 0.205–0.211
 seconds and gained additional verified releases after background completion.
 These are individual observations, not a latency guarantee: indexer search
 alone took about five seconds. Eighteen focused tests passed on the deployed
 image. Hosted addon deadlines still need to cover search plus first verification.
+
+The resolution-aware follow-up passes 26 focused tests, including real runner
+integration checks for one worker per missing resolution, retrying failed
+1080p candidates before more 4K alternatives, respecting candidate/indexer
+caps, returning after one verified choice when only 1080p is present, and
+preserving successful results when the other resolution reaches the deadline.

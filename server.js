@@ -64,7 +64,7 @@ const { ensureSharedSecret, ensureAdminSecret, ensureStreamToken, getEffectiveSt
 const newznabService = require('./src/services/newznab');
 const easynewsService = require('./src/services/easynews');
 const { toFiniteNumber, toPositiveInt, toBoolean, parseCommaList, parsePathList, normalizeSortMode, resolvePreferredLanguages, resolveLanguageLabel, resolveLanguageLabels, toSizeBytesFromGb, toSizeBytesFromMb, collectConfigValues, computeManifestUrl, stripTrailingSlashes, decodeBase64Value, deriveSortOrder } = require('./src/utils/config');
-const { normalizeReleaseTitle, parseRequestedEpisode, isVideoFileName, fileMatchesEpisode, normalizeNzbdavPath, inferMimeType, normalizeIndexerToken, nzbMatchesIndexer, cleanSpecialSearchTitle, parseFilterList, normalizeResolutionToken } = require('./src/utils/parsers');
+const { normalizeReleaseTitle, parseRequestedEpisode, isVideoFileName, fileMatchesEpisode, normalizeNzbdavPath, inferMimeType, normalizeIndexerToken, nzbMatchesIndexer, cleanSpecialSearchTitle, parseFilterList } = require('./src/utils/parsers');
 const { sanitizeErrorForClient, TRIAGE_FINAL_STATUSES, isTriageFinalStatus, buildStreamCacheKey, restoreTriageDecisions, extractTriageOverrides, sleep, annotateNzbResult, applyMaxSizeFilter, prepareSortedResults, getPreferredLanguageMatch, getPreferredLanguageMatches, triageStatusRank, buildTriageTitleMap, prioritizeTriageCandidates, triageDecisionsMatchStatuses, sanitizeDecisionForCache, serializeFinalNzbResults, restoreFinalNzbResults, safeStat, formatStreamTitle } = require('./src/utils/helpers');
 const { maskSensitiveValues, unsentinelValues, CREDENTIAL_MASK_SENTINEL, SENSITIVE_KEYS, SENSITIVE_KEY_PATTERNS, isSensitiveKey } = require('./src/utils/credentialMask');
 const { buildTriageNntpConfig, buildNntpServersArray } = require('./src/services/triage/nntpConfig');
@@ -104,7 +104,7 @@ const animeDatabase = require('./src/services/animeDatabase');
 const autoAdvanceQueue = require('./src/services/autoAdvanceQueue');
 const backgroundTriage = require('./src/services/backgroundTriage');
 const diskNzbCache = require('./src/cache/diskNzbCache');
-const { createProgressiveTriage, mergeCompletedDecisions } = require('./src/services/triage/progressive');
+const { createProgressiveTriage, mergeCompletedDecisions, getReleaseResolution, getResolutionCoverage, prioritizeResolutionCandidates } = require('./src/services/triage/progressive');
 const progressiveTriage = createProgressiveTriage(triageAndRank);
 const profileManager = require('./src/services/profileManager');
 
@@ -3405,28 +3405,32 @@ async function streamHandler(req, res) {
     console.log(`[NZB TRIAGE] Triage pool size: ${triagePool.length} (from ${finalNzbResults.length} total results)`);
     const getDecisionStatus = (candidate) => {
       const decision = triageDecisions.get(candidate.downloadUrl);
+      if (isTriageFinalStatus(decision?.status)) return String(decision.status).toLowerCase();
+      const normalizedTitle = normalizeReleaseTitle(candidate.title);
+      const derived = normalizedTitle ? triageTitleMap.get(normalizedTitle) : null;
+      if (isTriageFinalStatus(derived?.status)
+        && indexerService.canShareDecision(derived.publishDateMs, candidate.publishDateMs)) {
+        return String(derived.status).toLowerCase();
+      }
       return decision && decision.status ? String(decision.status).toLowerCase() : null;
     };
     const pendingStatuses = new Set(['unverified', 'pending', 'fetch-error', 'error']);
-    const hasPendingRetries = triagePool.some((candidate) => pendingStatuses.has(getDecisionStatus(candidate)));
     const hasVerifiedResult = triagePool.some((candidate) => getDecisionStatus(candidate) === 'verified');
+    const missingResolutions = getResolutionCoverage(triagePool, getDecisionStatus).missing;
     let triageEligibleResults = [];
     const paidIndexerLimitMap = buildCombinedLimitMap(ACTIVE_NEWZNAB_CONFIGS);
     const getIndexerKey = (candidate) => normalizeIndexerToken(candidate?.indexerId || candidate?.indexer);
 
-    if (hasPendingRetries) {
-      triageEligibleResults = prioritizeTriageCandidates(triagePool, TRIAGE_MAX_CANDIDATES, {
-        shouldInclude: (candidate) => pendingStatuses.has(getDecisionStatus(candidate)),
+    const candidatesNeedingChecks = triagePool.filter(candidate => {
+      const status = getDecisionStatus(candidate);
+      return pendingStatuses.has(status)
+        || (!status && (!hasVerifiedResult || missingResolutions.includes(getReleaseResolution(candidate))));
+    });
+    triageEligibleResults = prioritizeTriageCandidates(
+      prioritizeResolutionCandidates(candidatesNeedingChecks, missingResolutions), TRIAGE_MAX_CANDIDATES, {
         perIndexerLimitMap: paidIndexerLimitMap,
         getIndexerKey,
       });
-    } else if (!hasVerifiedResult) {
-      triageEligibleResults = prioritizeTriageCandidates(triagePool, TRIAGE_MAX_CANDIDATES, {
-        shouldInclude: (candidate) => !getDecisionStatus(candidate),
-        perIndexerLimitMap: paidIndexerLimitMap,
-        getIndexerKey,
-      });
-    }
 
     if (triageEligibleResults.length === 0 && triageDecisions.size === 0) {
       triageEligibleResults = prioritizeTriageCandidates(triagePool, TRIAGE_MAX_CANDIDATES, {
@@ -3434,25 +3438,15 @@ async function streamHandler(req, res) {
         getIndexerKey,
       });
     }
-    const candidateHasConclusiveDecision = (candidate) => {
-      const decision = triageDecisions.get(candidate.downloadUrl);
-      if (decision && isTriageFinalStatus(decision.status)) {
-        return true;
-      }
-      const normalizedTitle = normalizeReleaseTitle(candidate.title);
-      if (normalizedTitle) {
-        const derived = triageTitleMap.get(normalizedTitle);
-        if (
-          derived
-          && isTriageFinalStatus(derived.status)
-          && indexerService.canShareDecision(derived.publishDateMs, candidate.publishDateMs)
-        ) {
-          return true;
-        }
-      }
-      return false;
-    };
+    const candidateHasConclusiveDecision = candidate => isTriageFinalStatus(getDecisionStatus(candidate));
     const triageCandidatesToRun = triageEligibleResults.filter((candidate) => !candidateHasConclusiveDecision(candidate));
+    // Cached proof counts toward its own resolution, while missing 4K/1080p
+    // choices still get checked. Never wait for a resolution absent from this
+    // bounded batch; candidate/indexer limits remain authoritative.
+    const foregroundCoverage = getResolutionCoverage([
+      ...triageCandidatesToRun,
+      ...triagePool.filter(candidate => getDecisionStatus(candidate) === 'verified'),
+    ], getDecisionStatus);
     const shouldSkipTriageForRequest = requestLacksIdentifiers || isSpecialRequest;
     const triageWanted = triageCandidatesToRun.length > 0 && !requestedDisable && !shouldSkipTriageForRequest && (requestedEnable || effTriageEnabled);
     const effectiveTriageMode = triageWanted ? effTriageMode : 'disabled';
@@ -3486,6 +3480,7 @@ async function streamHandler(req, res) {
           timeBudgetMs: TRIAGE_TIME_BUDGET_MS,
           maxCandidates: TRIAGE_MAX_CANDIDATES,
           downloadConcurrency: triageDownloadConcurrency,
+          foregroundResolutions: foregroundCoverage.missing,
           triageOptions: {
             ...TRIAGE_BASE_OPTIONS,
             nntpConfig: { ...TRIAGE_NNTP_CONFIG },
@@ -3503,7 +3498,7 @@ async function streamHandler(req, res) {
             ? { job: existingJob, joined: true }
             : progressiveTriage.start(scope, triageCandidatesToRun, triageOptions);
           progressiveTriageJob = job;
-          console.log(`[NZB TRIAGE] ${joined ? 'Joined' : 'Started'} progressive job ${job.id} (workers=${triageDownloadConcurrency})`);
+          console.log(`[NZB TRIAGE] ${joined ? 'Joined' : 'Started'} progressive job ${job.id} (workers=${triageDownloadConcurrency}, targets=${foregroundCoverage.missing.join(',') || 'first-verified'})`);
           if (!joined) {
             const candidatesByUrl = new Map(triageCandidatesToRun.map(candidate => [candidate.downloadUrl, candidate]));
             job.completion.then(outcome => {
@@ -3528,10 +3523,9 @@ async function streamHandler(req, res) {
               console.warn('[NZB TRIAGE] Background completion failed; unresolved releases remain pending');
             });
           }
-          // A previously verified release is already enough for a fast response.
-          // On a cold request, wait until a release actually passes, or all work
-          // finishes. Remaining candidates retain their real pending status.
-          triageOutcome = hasVerifiedResult ? job.snapshot() : await job.foreground;
+          // Return once every available target resolution has a verified choice,
+          // including existing cached proof, or the batch reaches its deadline.
+          triageOutcome = foregroundCoverage.ready ? job.snapshot() : await job.foreground;
           const latestDecisions = triageOutcome?.decisions instanceof Map ? triageOutcome.decisions : new Map(triageOutcome?.decisions || []);
           latestDecisions.forEach((decision, downloadUrl) => {
             triageDecisions.set(downloadUrl, decision);
@@ -3714,10 +3708,7 @@ async function streamHandler(req, res) {
       const releaseLanguageLabels = resolveLanguageLabels(releaseLanguages);
       const sourceLanguage = result.language || null;
       const sourceLanguageLabel = resolveLanguageLabel(sourceLanguage);
-      const qualityMatch = result.title?.match(/(4320p|2160p|1440p|1080p|720p|576p|540p|480p|360p|240p|8k|4k|uhd)/i);
-      const detectedResolutionToken = result.resolution
-        || releaseInfo.resolution
-        || (qualityMatch ? normalizeResolutionToken(qualityMatch[0]) : null);
+      const detectedResolutionToken = getReleaseResolution(result);
       const resolutionBadge = formatResolutionBadge(detectedResolutionToken);
       const rawQualityLabel = result.qualityLabel || releaseInfo.qualityLabel || null;
       const qualityLabel = rawQualityLabel && String(rawQualityLabel).toLowerCase() !== String(detectedResolutionToken || '').toLowerCase()

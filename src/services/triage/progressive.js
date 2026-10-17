@@ -1,8 +1,70 @@
 const crypto = require('crypto');
 const { sanitizeDecisionForCache, isTriageFinalStatus } = require('../../utils/helpers');
+const { normalizeResolutionToken } = require('../../utils/parsers');
+
+const FOREGROUND_RESOLUTIONS = ['4k', '1080p'];
+
+function getReleaseResolution(candidate) {
+  const result = candidate?.result || candidate || {};
+  const match = result.title?.match(/(4320p|2160p|1440p|1080p|720p|576p|540p|480p|360p|240p|8k|4k|uhd)/i);
+  const token = result.resolution || result.release?.resolution || match?.[0];
+  return token ? normalizeResolutionToken(String(token).trim()) : null;
+}
+
+function getResolutionCoverage(candidates, getStatus) {
+  const present = new Set(), verified = new Set();
+  let hasVerified = false;
+  for (const candidate of candidates) {
+    const resolution = getReleaseResolution(candidate);
+    if (FOREGROUND_RESOLUTIONS.includes(resolution)) present.add(resolution);
+    if (getStatus(candidate) === 'verified') {
+      hasVerified = true;
+      verified.add(resolution);
+    }
+  }
+  const missing = FOREGROUND_RESOLUTIONS.filter(resolution => present.has(resolution) && !verified.has(resolution));
+  return { missing, ready: hasVerified && missing.length === 0 };
+}
+
+// Reserve a place for each requested resolution before applying existing
+// candidate/indexer limits. Preserve the original order for the other releases.
+function prioritizeResolutionCandidates(candidates, resolutions) {
+  const remaining = candidates.slice(), first = [];
+  for (const resolution of resolutions) {
+    const index = remaining.findIndex(candidate => getReleaseResolution(candidate) === resolution);
+    if (index >= 0) first.push(...remaining.splice(index, 1));
+  }
+  return [...first, ...remaining];
+}
+
+// Give missing resolutions a connection each before trying alternatives of a
+// resolution already being checked. Once a resolution verifies, prioritize
+// remaining gaps, then continue the original bounded batch in the background.
+function createResolutionQueue(candidates, resolutions) {
+  const pending = candidates.slice(), active = new Map(), verified = new Set();
+  return {
+    next() {
+      if (!pending.length) return null;
+      const missing = resolutions.filter(resolution => !verified.has(resolution));
+      const idle = missing.filter(resolution => !active.get(resolution));
+      let index = pending.findIndex(candidate => idle.includes(getReleaseResolution(candidate)));
+      if (index < 0) index = pending.findIndex(candidate => missing.includes(getReleaseResolution(candidate)));
+      if (index < 0) index = 0;
+      const [candidate] = pending.splice(index, 1);
+      const resolution = getReleaseResolution(candidate);
+      active.set(resolution, (active.get(resolution) || 0) + 1);
+      return candidate;
+    },
+    complete(candidate, status) {
+      const resolution = getReleaseResolution(candidate);
+      active.set(resolution, Math.max(0, (active.get(resolution) || 0) - 1));
+      if (status === 'verified') verified.add(resolution);
+    },
+  };
+}
 
 // Keep the complete check running, but allow a response after a genuinely
-// verified release is available. Equivalent concurrent requests share the work.
+// verified release of each requested resolution is available.
 function createProgressiveTriage(runTriage, now = Date.now) {
   const active = new Map();
   let nextId = 0;
@@ -18,6 +80,7 @@ function createProgressiveTriage(runTriage, now = Date.now) {
         indexerId: candidate.indexerId,
         indexer: candidate.indexer,
         published: candidate.publishDateMs,
+        resolution: getReleaseResolution(candidate),
       })),
       policy,
     })).digest('hex');
@@ -25,6 +88,9 @@ function createProgressiveTriage(runTriage, now = Date.now) {
     if (existing) return { job: existing, joined: true };
 
     const decisions = new Map();
+    const candidatesByUrl = new Map(candidates.map(candidate => [candidate.downloadUrl, candidate]));
+    const verifiedResolutions = new Set();
+    const requiredResolutions = options.foregroundResolutions || [];
     const startedAt = now();
     let resolveVerified;
     const firstVerified = new Promise(resolve => { resolveVerified = resolve; });
@@ -56,7 +122,12 @@ function createProgressiveTriage(runTriage, now = Date.now) {
         }
         // Mounted, skipped, timed out, and inconclusive releases cannot release
         // the foreground wait. Only the runner's full verification can do so.
-        if (decision.status === 'verified') resolveVerified(job.snapshot());
+        if (decision.status === 'verified') {
+          verifiedResolutions.add(getReleaseResolution(candidatesByUrl.get(url)));
+          if (requiredResolutions.every(resolution => verifiedResolutions.has(resolution))) {
+            resolveVerified(job.snapshot());
+          }
+        }
       },
     })).then(result => {
       job.result = result;
@@ -104,4 +175,7 @@ function mergeCompletedDecisions(meta, jobId, decisions) {
   return true;
 }
 
-module.exports = { createProgressiveTriage, mergeCompletedDecisions };
+module.exports = {
+  createProgressiveTriage, mergeCompletedDecisions, getReleaseResolution,
+  getResolutionCoverage, prioritizeResolutionCandidates, createResolutionQueue,
+};

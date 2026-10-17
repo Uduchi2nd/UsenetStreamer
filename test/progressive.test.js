@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createProgressiveTriage, mergeCompletedDecisions } = require('../src/services/triage/progressive');
+const { createProgressiveTriage, mergeCompletedDecisions, getResolutionCoverage, prioritizeResolutionCandidates } = require('../src/services/triage/progressive');
+const { prioritizeTriageCandidates } = require('../src/utils/helpers');
 
 function deferred() {
   let resolve, reject;
@@ -189,4 +190,67 @@ test('completion from a previous response generation cannot patch a replacement'
   const meta = cacheMeta(), original = structuredClone(meta);
   assert.equal(mergeCompletedDecisions(meta, 6, new Map()), false);
   assert.deepEqual(meta, original);
+});
+
+test('early return needs one verified 4K and 1080p choice, not two of the same resolution', async () => {
+  const releases = [
+    { ...candidates[0], resolution: '2160p' },
+    { ...candidates[1], release: { resolution: '1080p' } },
+    { downloadUrl: 'https://example.invalid/c', title: 'Movie UHD' },
+  ];
+  const finish = deferred();
+  let callback;
+  const coordinator = createProgressiveTriage(async (_, options) => {
+    callback = options.onDecision;
+    await finish.promise;
+    return outcome(new Map());
+  });
+  const { job } = coordinator.start('resolutions', releases, { foregroundResolutions: ['4k', '1080p'] });
+  let returned = false;
+  job.foreground.then(() => { returned = true; });
+  await tick();
+  callback(releases[0].downloadUrl, { status: 'verified' });
+  callback(releases[2].downloadUrl, { status: 'verified' });
+  callback(releases[1].downloadUrl, { status: 'unverified' });
+  await tick();
+  assert.equal(returned, false);
+  callback(releases[1].downloadUrl, { status: 'verified' });
+  assert.equal((await job.foreground).inProgress, true);
+  assert.equal(job.done, false);
+  finish.resolve();
+  await job.completion;
+});
+
+test('cached proof counts only for its own resolution and does not hide an unchecked missing resolution', () => {
+  const releases = [
+    { ...candidates[0], resolution: 'UHD' },
+    { ...candidates[1], title: 'Movie 1080p' },
+  ];
+  const statuses = new Map([[releases[0].downloadUrl, 'verified']]);
+  const status = candidate => statuses.get(candidate.downloadUrl);
+  assert.deepEqual(getResolutionCoverage(releases, status), { missing: ['1080p'], ready: false });
+  statuses.set(releases[1].downloadUrl, 'verified');
+  assert.deepEqual(getResolutionCoverage(releases, status), { missing: [], ready: true });
+  assert.deepEqual(getResolutionCoverage([releases[0]], status), { missing: [], ready: true });
+});
+
+test('only existing target resolutions are required; unknown resolutions still need real proof', () => {
+  const hd = [{ ...candidates[0], resolution: '1080P' }];
+  assert.deepEqual(getResolutionCoverage(hd, () => null), { missing: ['1080p'], ready: false });
+  assert.deepEqual(getResolutionCoverage(hd, () => 'verified'), { missing: [], ready: true });
+  assert.deepEqual(getResolutionCoverage(candidates, () => 'unverified'), { missing: [], ready: false });
+  assert.deepEqual(getResolutionCoverage(candidates, () => 'verified'), { missing: [], ready: true });
+});
+
+test('reserve both resolutions within the candidate cap while retaining indexer limits', () => {
+  const many = Array.from({ length: 20 }, (_, i) => ({
+    downloadUrl: `https://example.invalid/${i}`, title: `Movie ${i} 2160p`, indexerId: 'one',
+  }));
+  const hd = { downloadUrl: 'https://example.invalid/hd', title: 'Movie 1080p', indexerId: 'two' };
+  const ordered = prioritizeResolutionCandidates([...many, hd], ['4k', '1080p']);
+  const selected = prioritizeTriageCandidates(ordered, 16, {
+    perIndexerLimitMap: new Map([['one', 1], ['two', 1]]),
+    getIndexerKey: candidate => candidate.indexerId,
+  });
+  assert.deepEqual(selected, [many[0], hd]);
 });

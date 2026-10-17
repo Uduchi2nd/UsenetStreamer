@@ -5,6 +5,7 @@ const { getDownloadUserAgentForIndexer, getProxyForIndexer } = require('../newzn
 const { getManagerProxy } = require('../indexer');
 const { proxiedGet } = require('../../utils/proxyAgent');
 const diskNzbCache = require('../../cache/diskNzbCache');
+const { prioritizeResolutionCandidates, createResolutionQueue } = require('./progressive');
 
 const DEFAULT_TIME_BUDGET_MS = 40000;
 const DEFAULT_MAX_CANDIDATES = 25;
@@ -190,7 +191,9 @@ async function triageAndRank(nzbResults, options = {}) {
   const constrainedCandidates = allowedIndexerSet.size > 0
     ? builtCandidates.filter((candidate) => candidateMatchesIndexerSet(candidate, allowedIndexerSet))
     : builtCandidates;
-  const candidates = rankCandidates(constrainedCandidates, preferredSizeBytes, preferredIndexerSet);
+  const foregroundResolutions = options.foregroundResolutions || [];
+  const candidates = prioritizeResolutionCandidates(
+    rankCandidates(constrainedCandidates, preferredSizeBytes, preferredIndexerSet), foregroundResolutions);
   const uniqueCandidates = [];
   const seenTitles = new Set();
   candidates.forEach((candidate) => {
@@ -221,6 +224,12 @@ async function triageAndRank(nzbResults, options = {}) {
   });
 
   const decisionMap = new Map();
+  const queue = createResolutionQueue(selectedCandidates, foregroundResolutions);
+  const recordDecision = (url, decision) => {
+    decisionMap.set(url, decision);
+    queue.complete(candidateByUrl.get(url), decision.status);
+    if (onDecisionCb) try { onDecisionCb(url, decision); } catch { /* ignore */ }
+  };
 
   const attachMetadata = (url, decision) => {
     const candidateInfo = candidateByUrl.get(url);
@@ -279,7 +288,6 @@ async function triageAndRank(nzbResults, options = {}) {
     }
   };
 
-  let cursor = 0;
   let timedOut = false;
   let evaluatedCount = 0;
   let fetchFailures = 0;
@@ -296,14 +304,14 @@ async function triageAndRank(nzbResults, options = {}) {
   const workers = Array.from({ length: downloadConcurrency }, async () => {
     while (true) {
       if (timedOut) return;
-      const index = cursor;
-      if (index >= selectedCandidates.length) return;
-      cursor += 1;
-
-      const candidate = selectedCandidates[index];
+      const candidate = queue.next();
+      if (!candidate) return;
       const { downloadUrl } = candidate;
 
-      if (decisionMap.has(downloadUrl)) continue;
+      if (decisionMap.has(downloadUrl)) {
+        queue.complete(candidate, decisionMap.get(downloadUrl).status);
+        continue;
+      }
 
       const indexerKey = normalizeIndexerToken(candidate.indexerId)
         || normalizeIndexerToken(candidate.indexerName);
@@ -311,8 +319,7 @@ async function triageAndRank(nzbResults, options = {}) {
       if (Date.now() - startTs >= timeBudgetMs) {
         timedOut = true;
         const timeoutDecision = makeTimeoutDecision(downloadUrl);
-        decisionMap.set(downloadUrl, timeoutDecision);
-        if (onDecisionCb) try { onDecisionCb(downloadUrl, timeoutDecision); } catch { /* ignore */ }
+        recordDecision(downloadUrl, timeoutDecision);
         continue;
       }
 
@@ -423,8 +430,7 @@ async function triageAndRank(nzbResults, options = {}) {
             nzbIndex: null,
             fileCount: null,
           });
-          decisionMap.set(downloadUrl, fetchErrDecision);
-          if (onDecisionCb) try { onDecisionCb(downloadUrl, fetchErrDecision); } catch { /* ignore */ }
+          recordDecision(downloadUrl, fetchErrDecision);
           logEvent(logger, 'warn', 'NZB download:failed', {
             downloadUrl,
             message: err?.code === 'ERR_CANCELED' || err?.message === 'canceled'
@@ -440,6 +446,7 @@ async function triageAndRank(nzbResults, options = {}) {
       }
 
       if (!nzbPayload) {
+        queue.complete(candidate, 'skipped');
         continue;
       }
 
@@ -462,9 +469,8 @@ async function triageAndRank(nzbResults, options = {}) {
             summarized.nzbPayload = nzbPayload;
           }
           const finalDecision = attachMetadata(downloadUrl, summarized);
-          decisionMap.set(downloadUrl, finalDecision);
+          recordDecision(downloadUrl, finalDecision);
           evaluatedCount += 1;
-          if (onDecisionCb) try { onDecisionCb(downloadUrl, finalDecision); } catch { /* ignore */ }
         } else {
           const noResultDecision = attachMetadata(downloadUrl, {
             status: 'error',
@@ -474,15 +480,13 @@ async function triageAndRank(nzbResults, options = {}) {
             nzbIndex: null,
             fileCount: null,
           });
-          decisionMap.set(downloadUrl, noResultDecision);
-          if (onDecisionCb) try { onDecisionCb(downloadUrl, noResultDecision); } catch { /* ignore */ }
+          recordDecision(downloadUrl, noResultDecision);
         }
       } catch (err) {
         if (err?.code === TIMEOUT_ERROR_CODE) {
           timedOut = true;
           const toDecision = makeTimeoutDecision(downloadUrl);
-          decisionMap.set(downloadUrl, toDecision);
-          if (onDecisionCb) try { onDecisionCb(downloadUrl, toDecision); } catch { /* ignore */ }
+          recordDecision(downloadUrl, toDecision);
         } else {
           const errDecision = attachMetadata(downloadUrl, {
             status: 'error',
@@ -492,8 +496,7 @@ async function triageAndRank(nzbResults, options = {}) {
             nzbIndex: null,
             fileCount: null,
           });
-          decisionMap.set(downloadUrl, errDecision);
-          if (onDecisionCb) try { onDecisionCb(downloadUrl, errDecision); } catch { /* ignore */ }
+          recordDecision(downloadUrl, errDecision);
         }
         logEvent(logger, 'warn', 'NZB triage failed', { message: err?.message });
       }
