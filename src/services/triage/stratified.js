@@ -1,6 +1,6 @@
 // One uniformly random article from each evenly spaced stratum, across each file.
 const FRACTION = 0.30;
-const BATCH_SIZE = 64;
+const BATCH_SIZE = 128;
 function sampleSegments(segments, random = Math.random) {
   const seen = new Set();
   const ordered = segments.slice().sort((a, b) => a.number - b.number)

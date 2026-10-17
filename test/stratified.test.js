@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { sampleSegments, pipeline, checkSample } = require('../src/services/triage/stratified');
+const { BATCH_SIZE, sampleSegments, pipeline, checkSample } = require('../src/services/triage/stratified');
 const segments = n => Array.from({length:n}, (_,i)=>({number:i+1,id:`p${i}@test`}));
 test('30 percent without replacement covers every stratum even with shuffled NZB order',()=>{
   for(const n of [0,1,2,3,10,1022,2058,6719]) {
@@ -18,12 +18,14 @@ function socket(reply) {
 }
 test('pipeline handles fragmented replies and checks the entire selected sample',async()=>{
   const s=socket((sock,ids)=>{const text=ids.map(id=>`223 0 <${id}> exists\r\n`).join('');sock.emit('data',Buffer.from(text.slice(0,7)));sock.emit('data',Buffer.from(text.slice(7)));});
-  const r=await pipeline(s,segments(150).map(x=>x.id),1000);
-  assert.deepEqual(r,{planned:150,checked:150,missing:0});assert.deepEqual(s.commands.map(a=>a.length),[64,64,22]);
+  const count=2*BATCH_SIZE+22;
+  const r=await pipeline(s,segments(count).map(x=>x.id),1000);
+  assert.deepEqual(r,{planned:count,checked:count,missing:0});assert.deepEqual(s.commands.map(a=>a.length),[BATCH_SIZE,BATCH_SIZE,22]);
 });
 test('missing article drains batch then rejects early',async()=>{
  const s=socket((sock,ids)=>sock.emit('data',Buffer.from(ids.map((id,i)=>i===2?'430 missing\r\n':`223 0 <${id}> exists\r\n`).join(''))));
- assert.deepEqual(await pipeline(s,segments(100).map(x=>x.id),1000),{planned:100,checked:64,missing:1});assert.equal(s.commands.length,1);
+ const count=BATCH_SIZE+36;
+ assert.deepEqual(await pipeline(s,segments(count).map(x=>x.id),1000),{planned:count,checked:BATCH_SIZE,missing:1});assert.equal(s.commands.length,1);
 });
 test('unexpected status and mismatched identity cannot pass',async()=>{
  for(const line of ['500 unavailable\r\n','223 0 <other@test> exists\r\n']) {

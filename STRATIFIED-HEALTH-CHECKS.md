@@ -5,7 +5,7 @@ Based on upstream v1.8.4. This patch is in UsenetStreamer, not Remux or vnphim.
 ## Behavior
 For each recognized video/ISO/archive file, sort NZB articles by segment number, deduplicate IDs, then select ceil(30% of articles). Divide the whole ordered file into that many disjoint, evenly spaced sections and choose one random article from each. This covers beginning, middle and end; it is not a prefix download. PAR2/NFO and other ancillary files are excluded. Multipart archive parts are each sampled; existing archive format/header checks remain.
 
-STAT requests use batches of 64 on an exclusively leased existing NNTP connection. The configured two-connection pool remains in use. A positive result requires every selected article to return223 with the expected message ID.430 marks missing; drain the current batch and reject early. Timeout, unexpected response or transport error returns sample-incomplete/unverified, never verified. Sampling has a12-second network deadline after pool acquisition; the existing acquire and outer triage deadlines still apply. No video BODY download is added by this sampler; existing archive header inspection may still fetch data.
+STAT requests use batches of 128 on an exclusively leased existing NNTP connection. The configured two-connection pool remains in use. A positive result requires every selected article to return223 with the expected message ID.430 marks missing; drain the current batch and reject early. Timeout, unexpected response or transport error returns sample-incomplete/unverified, never verified. Sampling has a12-second network deadline after pool acquisition; the existing acquire and outer triage deadlines still apply. No video BODY download is added by this sampler; existing archive header inspection may still fetch data.
 
 The pinned nntp0.3.1 library serializes commands. The sampler takes over only an idle leased socket, then destroys/replaces it even on success so its parser cannot consume stale pipeline replies. This avoids a second connection pool. Updating the NNTP library requires revisiting this adapter.
 
@@ -51,7 +51,8 @@ Verified NZB payloads are retained in the existing disk cache; unverified NZBs
 are not promoted to that cache. Normal failed-job filtering remains in place.
 Hidden ISO/executable releases are excluded before spending health-check work.
 
-The sampler now pipelines 64 queries rather than 16 over the same connections.
+The sampler initially grew from 16 to 64 queries over the same connections;
+the benchmark below selects 128 for the current build.
 Coverage stays at 30%; successful samples still require every selected reply,
 including a matching article ID. Missing pieces drain the outstanding batch
 before rejecting. This reduces protocol round trips without adding connections.
@@ -87,3 +88,30 @@ integration checks for one worker per missing resolution, retrying failed
 1080p candidates before more 4K alternatives, respecting candidate/indexer
 caps, returning after one verified choice when only 1080p is present, and
 preserving successful results when the other resolution reaches the deadline.
+
+## STAT window benchmark — 2026-10-17
+
+Replayed the same seeded 30% samples from cached verified Infinity Castle
+4K/1080p NZBs: 5,463 and 6,148 article IDs respectively. Each trial used two
+concurrent test connections, with no video BODY requests or indexer downloads.
+The live service remained running and idle. Warmups were excluded; nine paired
+trials per window used balanced ordering across an initial pass and a six-order
+confirmation pass. Times below are median durations until both availability
+samples finished, excluding connection setup, XML parsing, archive inspection
+and indexer search.
+
+| STATs per connection | Both samples, median | Complete scored samples | Missing controls rejected |
+| --- | --- | --- | --- |
+| 64 | 2.200 s | 18/18 | 4/4 |
+| 128 | 1.975 s | 18/18 | 4/4 |
+| 256 | 2.055 s | 18/18 | 4/4 |
+
+Selected 128, about 10.2% faster than 64 for this check workload. Production
+still uses two connections, allowing at most 256 pipelined STATs outstanding.
+The 256 window did not improve the pooled median over 128 and sent more
+queries before rejecting a missing-article batch. The 30% coverage, article-ID
+matching, batch draining, parser disposal and existing deadlines are unchanged.
+This is a sampler measurement, not a 10.2% promise for complete listing time.
+Numeric evidence is retained privately at
+`~/usenet/stat-window-benchmark-20261017/decision.json`; raw fixture selections
+and logs in that directory must remain private.
